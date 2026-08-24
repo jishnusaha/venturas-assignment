@@ -4,6 +4,3 @@ anthropic>=1.0.0,<2         # vision extraction; messages.parse() for schema-val
 pydantic>=2.13,<3           # the extraction contract in ingest/schema.py
 python-dotenv>=1.2,<2       # loads ANTHROPIC_API_KEY from .env
 requests>=2.32,<3           # the accounting API client
-
-# Development only — not needed to run the pipeline.
-pytest>=9.0                 # unit tests for the normalizers and the validation gate
