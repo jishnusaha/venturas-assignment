@@ -7,29 +7,18 @@ from pydantic import ValidationError
 
 from ingest.prompt import SYSTEM_PROMPT, USER_INSTRUCTION
 from ingest.schema import (
-    ExtractionRun,
     ExtractedInvoice,
     FailedInvoice,
     InvoiceExtraction,
+    MEDIA_TYPES,
 )
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-INVOICE_DIRECTORY = "invoices"
 
 MODEL = "claude-sonnet-5"
 MAX_TOKENS = 16000
 EFFORT = "high"
-
-MEDIA_TYPES = {
-    ".pdf": "application/pdf",
-    ".jpg": "image/jpeg",
-    ".jpeg": "image/jpeg",
-    ".png": "image/png",
-    ".gif": "image/gif",
-    ".webp": "image/webp",
-}
 
 load_dotenv(REPO_ROOT / ".env")
 
@@ -46,73 +35,58 @@ def file_block(path: Path) -> dict:
     }
 
 
-def extract() -> ExtractionRun:
-    extracted: list[ExtractedInvoice] = []
-    failed: list[FailedInvoice] = []
-    invoice_dir = REPO_ROOT / INVOICE_DIRECTORY
-    for path in sorted(invoice_dir.iterdir()):
-        if path.is_file() and path.suffix.lower() in MEDIA_TYPES:
-            print(f"{path.name}\t{path.resolve()}")
-            try:
-                response = client.messages.parse(
-                    model=MODEL,
-                    max_tokens=MAX_TOKENS,
-                    thinking={"type": "adaptive"},
-                    output_config={"effort": EFFORT},
-                    system=SYSTEM_PROMPT,
-                    messages=[
-                        {
-                            "role": "user",
-                            "content": [
-                                file_block(path),
-                                {"type": "text", "text": USER_INSTRUCTION},
-                            ],
-                        }
+def extract(path: Path) -> ExtractedInvoice | FailedInvoice:
+
+    print(f"extracting: {path.name}\t{path.resolve()}")
+    try:
+        response = client.messages.parse(
+            model=MODEL,
+            max_tokens=MAX_TOKENS,
+            thinking={"type": "adaptive"},
+            output_config={"effort": EFFORT},
+            system=SYSTEM_PROMPT,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        file_block(path),
+                        {"type": "text", "text": USER_INSTRUCTION},
                     ],
-                    output_format=InvoiceExtraction,
-                )
-            except APIError as exc:
-                # Covers the non-2xx statuses, the connection failures and the timeouts
-                # alike. Recording it per document keeps one bad call from ending a run
-                # that has already paid for the documents before it.
-                failed.append(
-                    FailedInvoice(
-                        file_name=path.name,
-                        file_path=path.resolve(),
-                        reason="api_error",
-                        detail=f"{type(exc).__name__}: {exc}",
-                    )
-                )
-                continue
-            except ValidationError as exc:
-                # Schema-invalid JSON from a schema-constrained call means the text
-                # was cut off mid-object — raise MAX_TOKENS rather than trusting it.
-                failed.append(
-                    FailedInvoice(
-                        file_name=path.name,
-                        file_path=path.resolve(),
-                        reason="schema_invalid",
-                        detail=f"{exc.error_count()} schema errors; the response was probably truncated at MAX_TOKENS={MAX_TOKENS}",
-                    )
-                )
-                continue
+                }
+            ],
+            output_format=InvoiceExtraction,
+        )
+    except APIError as exc:
+        # Covers the non-2xx statuses, the connection failures and the timeouts
+        # alike. Recording it per document keeps one bad call from ending a run
+        # that has already paid for the documents before it.
+        return FailedInvoice(
+            file_name=path.name,
+            file_path=path.resolve(),
+            reason="api_error",
+            detail=f"{type(exc).__name__}: {exc}",
+        )
 
-            if response.parsed_output is None:
-                failed.append(
-                    FailedInvoice(
-                        file_name=path.name,
-                        file_path=path.resolve(),
-                        reason="incomplete_response",
-                        detail=f"model returned no parseable extraction (stop_reason={response.stop_reason})",
-                    )
-                )
-                continue
+    except ValidationError as exc:
+        # Schema-invalid JSON from a schema-constrained call means the text
+        # was cut off mid-object — raise MAX_TOKENS rather than trusting it.
+        return FailedInvoice(
+            file_name=path.name,
+            file_path=path.resolve(),
+            reason="schema_invalid",
+            detail=f"{exc.error_count()} schema errors; the response was probably truncated at MAX_TOKENS={MAX_TOKENS}",
+        )
 
-            extracted.append(
-                ExtractedInvoice(
-                    file_name=path.name,
-                    file_path=path.resolve(),
-                    extraction=response.parsed_output,
-                )
-            )
-    return ExtractionRun(extracted=extracted, failed=failed)
+    if response.parsed_output is None:
+        return FailedInvoice(
+            file_name=path.name,
+            file_path=path.resolve(),
+            reason="incomplete_response",
+            detail=f"model returned no parseable extraction (stop_reason={response.stop_reason})",
+        )
+
+    return ExtractedInvoice(
+        file_name=path.name,
+        file_path=path.resolve(),
+        extraction=response.parsed_output,
+    )
