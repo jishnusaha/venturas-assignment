@@ -301,3 +301,242 @@ class NormalizationRun(BaseModel):
 
     normalized: list[NormalizedInvoice] = Field(default_factory=list)
     failed: list[FailedNormalization] = Field(default_factory=list)
+
+
+class Partner(BaseModel):
+    """One row of the accounting system's supplier master, as returned by ``GET /partners``.
+
+    This is the trusted source for ``partner_code`` — the LLM never proposes one, because a
+    model asked for a partner code emits one that merely looks right and that is
+    unauditable (document-extract.md §3.3, "Supplier resolution"). ``aliases`` is
+    display-only, carried for a human reviewer, and is never matched against — the same
+    rule that keeps :attr:`NormalizedInvoice.supplier_name` out of supplier resolution.
+    """
+
+    partner_code: str = Field(
+        description="The accounting system's identifier for this supplier, e.g. 'P-1001'. This is the value that decides who receives payment."
+    )
+    name: str = Field(description="The partner's registered legal name.")
+    aliases: list[str] = Field(
+        description="Alternate names this supplier may print on an invoice. For a human reviewer only — never used to resolve a partner_code."
+    )
+    registration_no: str = Field(
+        description="The partner's own 登録番号 (T + 13 digits) — the key an invoice's normalized registration number is matched against."
+    )
+
+
+class SupplierResolution(BaseModel):
+    """How one invoice's supplier was matched to a ``partner_code`` — the audit trail for
+    the single highest-weight decision in the pipeline (document-extract.md §3.3, "Supplier
+    resolution"). A wrong ``partner_code`` pays the wrong company and, unlike a bad amount
+    or a bad date, produces no error from the accounting API at all — nothing downstream
+    catches it, so this record is what lets an auditor see *how* the partner was chosen,
+    not merely which one.
+    """
+
+    raw: str = Field(
+        description="登録番号 exactly as printed on the invoice, before any cleaning — the same string as source.registration_no_raw."
+    )
+    normalized: str = Field(
+        description="`raw` after normalize_registration_no: folded, hyphens and whitespace stripped, uppercased. This is the key looked up in the partner index."
+    )
+    partner_code: str = Field(description="The matched partner's accounting-system code.")
+    partner_name: str = Field(
+        description="The matched partner's name, carried through for a human reviewer even though name is never part of the match."
+    )
+    matched_by: Literal["registration_no"] = Field(
+        description=(
+            "How the partner was chosen. One member today, deliberately: this documents the "
+            "method for an auditor rather than encoding a live choice, and leaves room for a "
+            "future match strategy (e.g. by name) to be added without reshaping this field."
+        )
+    )
+
+
+# Every reason validate can fail an invoice for, in the order the checks in ingest/validate.py
+# run and therefore the order a reason can first appear in FailedValidation.issues:
+#
+#   supplier_not_in_master     — check 1: registration_no missing, malformed, or unmatched
+#   missing_invoice_number     — check 2
+#   missing_issue_date         — check 2
+#   missing_due_date           — check 2
+#   no_line_items              — check 2
+#   missing_line_field         — check 2, per line: description or amount unreadable
+#   missing_printed_amount     — check 2: subtotal, tax_amount, or total_amount absent
+#   tax_code_unresolved        — check 4: no T10/T08 candidate matches the printed 消費税
+#   subtotal_mismatch          — check 5
+#   tax_mismatch                — check 5
+#   total_mismatch              — check 5
+#   due_date_before_issue_date — check 6
+#   date_disagreement          — check 7: our parser vs the extraction model's own reading
+#   duplicate_invoice          — check 8: (partner_code, invoice_number) already seen
+#
+# A module-level Literal alias rather than embedding the set twice, so ValidationIssue.code
+# and FailedValidation.reason cannot drift out of sync with each other.
+ValidationReason = Literal[
+    "supplier_not_in_master",
+    "missing_invoice_number",
+    "missing_issue_date",
+    "missing_due_date",
+    "no_line_items",
+    "missing_line_field",
+    "missing_printed_amount",
+    "tax_code_unresolved",
+    "subtotal_mismatch",
+    "tax_mismatch",
+    "total_mismatch",
+    "due_date_before_issue_date",
+    "date_disagreement",
+    "duplicate_invoice",
+]
+
+
+class ValidationIssue(BaseModel):
+    """One problem found while validating an invoice — one entry per problem, not one per
+    invoice. validate collects every issue it can evaluate in a single pass (see
+    ingest/validate.py) rather than stopping at the first, so a human reviewing a failed
+    invoice sees everything wrong with it at once instead of fixing one problem, re-running
+    the pipeline, and discovering the next.
+    """
+
+    code: ValidationReason = Field(
+        description="Which check failed. See ValidationReason for the full set and which check in ingest/validate.py produces each."
+    )
+    field: str = Field(
+        description=(
+            "Which field or row this issue concerns, e.g. 'registration_no', 'total_amount', "
+            "or 'lines[2].amount' for a per-line problem — points a reviewer at the exact spot "
+            "to check rather than the whole invoice."
+        )
+    )
+    detail: str = Field(
+        description="Plain language for the accounting clerk who keys this invoice by hand, naming the Japanese field label (登録番号, 小計, 消費税, 合計, お支払期日 ...) where it helps them find it on the paper."
+    )
+
+
+class RegistrationLine(BaseModel):
+    """One line item exactly as the accounting API's ``lines[]`` entry expects it — see
+    ``accounting_api.py``'s ``_check_shape`` (lines 133-201) for the fields it checks. No
+    provenance fields live here (no row index, no printed string); carrying one would make
+    this model not directly postable, which is the property :class:`RegistrationPayload`
+    exists to have.
+    """
+
+    description: str = Field(description="品名・摘要. Required non-empty by the API.")
+    quantity: int | None = Field(description="数量, or null — the API accepts either.")
+    unit: str = Field(
+        description="単位. Required non-empty by the API; validate defaults a blank cell to '該当なし' since the API rejects an empty string here."
+    )
+    unit_price: int | None = Field(description="単価, or null — the API accepts either.")
+    amount: int = Field(
+        description="金額. Required, and the figure every arithmetic check in validate is built from."
+    )
+    tax_code: Literal["T10", "T08"] = Field(
+        description="This line's consumption-tax code — printed on the invoice, or derived by validate and confirmed against the printed 消費税 when nothing was printed. The API rejects any other value."
+    )
+
+
+class RegistrationPayload(BaseModel):
+    """The exact body ``POST /invoices`` expects. ``model_dump(mode="json")`` on this model
+    is directly postable with no reshaping — that is why it carries no provenance fields
+    (file name, upstream record, review notes); those live one level up, on
+    :class:`ValidatedInvoice`.
+
+    ``issue_date`` and ``due_date`` are Python ``date`` objects; under ``mode="json"``
+    pydantic serializes a ``date`` as ``YYYY-MM-DD``, which is the only format
+    ``accounting_api.py``'s ``_check_shape`` (``DATE_PATTERN``) accepts.
+    """
+
+    partner_code: str = Field(
+        description="Resolved by validate's supplier-resolution check (SupplierResolution.partner_code) — never supplied by the extraction model."
+    )
+    invoice_number: str = Field(description="請求書番号, checked non-empty by validate.")
+    issue_date: date = Field(
+        description="発行日, checked non-None by validate. Serializes to YYYY-MM-DD."
+    )
+    due_date: date = Field(
+        description="お支払期日, checked non-None and >= issue_date by validate. Serializes to YYYY-MM-DD."
+    )
+    currency: Literal["JPY"] = Field(
+        default="JPY",
+        description="The only currency the accounting API accepts; fixed here since nothing in this pipeline reads or produces another.",
+    )
+    lines: list[RegistrationLine] = Field(
+        description="Every line item, in printed order, with unit defaulted and tax_code resolved by validate."
+    )
+    subtotal: int = Field(
+        description="小計, checked by validate against the sum of the line amounts."
+    )
+    tax_amount: int = Field(
+        description="消費税, checked by validate against the per-tax-code recalculation, floored exactly as accounting_api.py computes it."
+    )
+    total_amount: int = Field(
+        description="合計, checked by validate against subtotal + tax_amount."
+    )
+
+
+class ValidatedInvoice(BaseModel):
+    """One invoice that passed every check in validate — a self-contained record of a
+    registration decision. ``source`` embeds the whole upstream :class:`NormalizedInvoice`
+    this was built from, the same reasoning as :attr:`NormalizedInvoice.source`: nothing
+    about how a value was produced has to be cross-referenced back into
+    ``output/normalize.json`` to audit it.
+    """
+
+    file_name: str = Field(
+        description="The document's file name, carried through unchanged from every earlier stage."
+    )
+    file_path: Path = Field(
+        description="Absolute path to the source document on disk, carried through unchanged."
+    )
+    source: NormalizedInvoice = Field(
+        description="The whole upstream normalized record this was validated from, unchanged — the audit trail back to every printed value."
+    )
+    supplier: SupplierResolution = Field(
+        description="How the partner_code in `payload` was resolved."
+    )
+    payload: RegistrationPayload = Field(
+        description="The ready-to-POST registration body — see RegistrationPayload."
+    )
+    notes: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every value validate supplied rather than read off the page — a defaulted unit, "
+            "a derived tax code — naming the affected rows, so a reviewer can see what was not "
+            "printed on the paper even though the invoice registered cleanly."
+        ),
+    )
+
+
+class FailedValidation(BaseModel):
+    """An invoice that failed at least one check in validate.
+
+    ``reason``/``detail`` are ``issues[0]``'s ``code``/``detail`` — the first problem found,
+    in check order — mirroring :class:`FailedNormalization` so this record is routable (branch
+    on ``reason``) and readable (read ``detail``) without opening ``issues`` at all. ``issues``
+    carries everything validate found, not only the first, so a human fixing this invoice by
+    hand sees every problem in one pass rather than fixing one, re-running the pipeline, and
+    discovering the next.
+    """
+
+    file_name: str = Field(description="The document's file name.")
+    file_path: Path = Field(description="Absolute path to the source document on disk.")
+    reason: ValidationReason = Field(
+        description="issues[0].code — the first problem found, in check order, for routing."
+    )
+    detail: str = Field(
+        description="issues[0].detail — plain language for the accounting clerk who has to key this invoice by hand."
+    )
+    issues: list[ValidationIssue] = Field(
+        description="Every problem validate found on this invoice, in check order — not only the first."
+    )
+
+
+class ValidationRun(BaseModel):
+    """The result of one pass of validate over a :class:`NormalizationRun`'s successes,
+    mirroring ``NormalizationRun{normalized, failed}`` and ``ExtractionRun{extracted,
+    failed}`` — see :class:`NormalizationRun`.
+    """
+
+    validated: list[ValidatedInvoice] = Field(default_factory=list)
+    failed: list[FailedValidation] = Field(default_factory=list)

@@ -13,13 +13,23 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from ingest.accounting import (
+    AccountingAPIError,
+    get_partners,
+    get_registered_invoices,
+    health,
+)
+from ingest.validate import build_partner_index, validate
 from ingest.schema import (
     ExtractedInvoice,
     FailedInvoice,
     ExtractionRun,
     NormalizationRun,
     FailedNormalization,
+    FailedValidation,
     NormalizedInvoice,
+    ValidatedInvoice,
+    ValidationRun,
     MEDIA_TYPES,
 )  # noqa: E402
 from ingest.extract import extract  # noqa: E402
@@ -28,6 +38,7 @@ from ingest.normalize import normalize  # noqa: E402
 OUTPUT_DIR = REPO_ROOT / "output"
 EXTRACT_OUTPUT = OUTPUT_DIR / "extract.json"
 NORMALIZE_OUTPUT = OUTPUT_DIR / "normalize.json"
+VALIDATE_OUTPUT = OUTPUT_DIR / "validate.json"
 INVOICE_DIR = REPO_ROOT / "invoices"
 
 load_dotenv(REPO_ROOT / ".env")
@@ -45,6 +56,50 @@ def write_output(path: Path, payload: str) -> None:
 
 
 if __name__ == "__main__":
+    # The run cannot proceed without a trustworthy supplier master and duplicate ledger, so
+    # every accounting API call needed to build them happens up front and exits loudly on
+    # failure rather than letting the loop below limp along with nothing to validate against.
+    try:
+        health_status = health()
+    except AccountingAPIError as exc:
+        sys.exit(
+            f"accounting API is unreachable ({exc.code or 'no code'}): {exc.message}. "
+            "Start accounting_api.py and retry."
+        )
+
+    try:
+        partners = get_partners()
+    except AccountingAPIError as exc:
+        sys.exit(
+            f"could not load the supplier master from the accounting API "
+            f"({exc.code or 'no code'}): {exc.message}."
+        )
+
+    try:
+        partner_index = build_partner_index(partners)
+    except ValueError as exc:
+        sys.exit(f"supplier master has a collision and cannot be used: {exc}")
+
+    try:
+        registered_invoices = get_registered_invoices()
+    except AccountingAPIError as exc:
+        sys.exit(
+            f"could not load the registered-invoice ledger from the accounting API "
+            f"({exc.code or 'no code'}): {exc.message}."
+        )
+
+    # Seeded here so an invoice already sitting in the ledger is caught by validate's
+    # duplicate check rather than surfacing later as a 409 from the register stage.
+    seen_keys: set[tuple[str, str]] = {
+        (record["partner_code"], record["invoice_number"])
+        for record in registered_invoices
+    }
+
+    print(
+        f"accounting API ok (status={health_status.get('status')}); "
+        f"{len(partners)} partner(s) loaded; {len(seen_keys)} invoice(s) already registered"
+    )
+
     # extraction data
     extraction_success_list: list[ExtractedInvoice] = []
     extraction_failed_list: list[FailedInvoice] = []
@@ -52,6 +107,10 @@ if __name__ == "__main__":
     # normalization data
     normalization_success_list: list[NormalizedInvoice] = []
     normalization_failed_list: list[FailedNormalization] = []
+
+    # validation data
+    validation_success_list: list[ValidatedInvoice] = []
+    validation_failed_list: list[FailedValidation] = []
 
     for path in sorted(INVOICE_DIR.iterdir()):
         if path.is_file() and path.suffix.lower() in MEDIA_TYPES:
@@ -64,7 +123,22 @@ if __name__ == "__main__":
                     normalized_data = normalize(extracted_data)
                     if isinstance(normalized_data, NormalizedInvoice):
                         normalization_success_list.append(normalized_data)
+                        validated_data = validate(
+                            normalized_data, partner_index, seen_keys
+                        )
+                        if isinstance(validated_data, ValidatedInvoice):
+                            validation_success_list.append(validated_data)
+                            # The *second* copy of a within-batch duplicate is the one that
+                            # fails, so the key only enters the set once this one has passed.
+                            seen_keys.add(
+                                (
+                                    validated_data.payload.partner_code,
+                                    validated_data.payload.invoice_number,
+                                )
+                            )
 
+                        else:
+                            validation_failed_list.append(validated_data)
                     else:
                         normalization_failed_list.append(normalized_data)
 
@@ -80,3 +154,8 @@ if __name__ == "__main__":
         normalized=normalization_success_list, failed=normalization_failed_list
     )
     write_output(NORMALIZE_OUTPUT, normalization_result.model_dump_json(indent=2))
+
+    validation_result = ValidationRun(
+        validated=validation_success_list, failed=validation_failed_list
+    )
+    write_output(VALIDATE_OUTPUT, validation_result.model_dump_json(indent=2))
