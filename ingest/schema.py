@@ -4,7 +4,7 @@ from datetime import date
 from pathlib import Path
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 MEDIA_TYPES = {
     ".pdf": "application/pdf",
@@ -53,14 +53,7 @@ class ExtractionFlags(BaseModel):
     handwriting_note: str = Field(
         description="Where the handwriting is and what it appears to say. Empty string when there is none."
     )
-    illegible_fields: list[str] = Field(
-        default_factory=list,
-        description="Names of fields that could not be read at all (blur, crop, ink).",
-    )
-    low_confidence_fields: list[str] = Field(
-        default_factory=list,
-        description="Names of fields that were read but with genuine doubt about a character.",
-    )
+
 
 
 class InvoiceExtraction(BaseModel):
@@ -104,6 +97,65 @@ class InvoiceExtraction(BaseModel):
     flags: ExtractionFlags
 
 
+class ExtractionUsage(BaseModel):
+    """What one call to the extraction model actually consumed.
+
+    Recorded per document because "what does this cost to run" is a question the client
+    asked in production terms, and a number derived from a token-count guess is not an
+    answer to it. Every field here is measured — the token counts come from the API's own
+    ``usage`` object and ``latency_seconds`` is wall-clock around the call — except the
+    three cost fields, which apply a published per-token rate to those measured counts.
+
+    ``cost_usd`` is ``None`` rather than an estimate when the served model is not in
+    ``ingest.extract.PRICE_PER_MTOK``: the token counts stay valid and auditable either
+    way, and a priced-at-a-guessed-rate figure is exactly the kind of number that gets
+    quoted back later as if it had been measured.
+    """
+
+    model: str = Field(
+        description="The model ID the API reports as having served this call."
+    )
+    input_tokens: int = Field(description="Billed input tokens: the prompt and the document.")
+    output_tokens: int = Field(
+        description="Billed output tokens, thinking tokens included."
+    )
+    thinking_tokens: int | None = Field(
+        default=None,
+        description=(
+            "The share of output_tokens spent on extended thinking, when the API reports "
+            "the breakdown. Already counted inside output_tokens — never added to it."
+        ),
+    )
+    cache_read_input_tokens: int = Field(
+        default=0,
+        description="Input tokens served from the prompt cache. Zero: this stage sets no cache_control.",
+    )
+    cache_creation_input_tokens: int = Field(
+        default=0, description="Input tokens written to the prompt cache. Zero, for the same reason."
+    )
+    latency_seconds: float = Field(
+        description="Wall-clock seconds around the API call, SDK retries included."
+    )
+    input_cost_usd: float | None = Field(
+        default=None, description="Input tokens at the published rate. None if the model is unpriced."
+    )
+    output_cost_usd: float | None = Field(
+        default=None, description="Output tokens at the published rate. None if the model is unpriced."
+    )
+    cost_usd: float | None = Field(
+        default=None,
+        description="input_cost_usd + output_cost_usd. None if the model is unpriced.",
+    )
+    from_cache: bool = Field(
+        default=False,
+        description=(
+            "True when this record was replayed from a previous run's output/extract.json "
+            "rather than measured on this run — the measurement is real, but no API call "
+            "was made and nothing was billed this run. See ingest/extract.py."
+        ),
+    )
+
+
 class ExtractedInvoice(BaseModel):
     """One source document paired with the model's reading of it.
 
@@ -117,6 +169,14 @@ class ExtractedInvoice(BaseModel):
     file_path: Path = Field(description="Absolute path to the source document on disk.")
     extraction: InvoiceExtraction = Field(
         description="The schema-validated reading of that document."
+    )
+    usage: ExtractionUsage | None = Field(
+        default=None,
+        description=(
+            "What the call that produced this extraction cost. Optional because an "
+            "extract.json written before this field existed must still load — an absent "
+            "record means unmeasured, never free."
+        ),
     )
 
 
@@ -139,6 +199,64 @@ class FailedInvoice(BaseModel):
     detail: str = Field(
         description="The specific error, for the human who has to act on it."
     )
+    usage: ExtractionUsage | None = Field(
+        default=None,
+        description=(
+            "What the failed call consumed, when a response came back at all — a refusal "
+            "or a truncated extraction is billed like any other. None where the call never "
+            "returned a message, since there is nothing to measure."
+        ),
+    )
+
+
+class ExtractionTotals(BaseModel):
+    """The extraction stage's cost and latency for one run, in the terms the client asked.
+
+    Derived, never stored: :class:`ExtractionRun` recomputes this from the per-document
+    :class:`ExtractionUsage` records every time it is built or loaded, so the summary
+    cannot drift away from the measurements it summarizes.
+    """
+
+    documents_measured: int = Field(
+        description="Documents carrying a usage record, whether measured now or replayed."
+    )
+    documents_billed_this_run: int = Field(
+        description=(
+            "Documents that actually hit the API on this run. Lower than "
+            "documents_measured whenever extract.py replayed a cached extraction — that "
+            "run cost nothing, and the averages below still describe the calls as measured."
+        )
+    )
+    input_tokens: int = Field(description="Summed across every measured document.")
+    output_tokens: int = Field(description="Summed across every measured document.")
+    api_seconds: float = Field(
+        description=(
+            "Summed call latency. Not the run's wall-clock time — the pipeline calls the "
+            "API one document at a time, so the two are close, but this measures the API."
+        )
+    )
+    mean_seconds_per_document: float | None = Field(
+        default=None, description="Processing time per invoice. None with nothing measured."
+    )
+    cost_usd: float | None = Field(
+        default=None,
+        description=(
+            "Summed cost across measured documents. None if any of them was served by a "
+            "model with no published rate in the table, since a partial sum reported as a "
+            "total would understate it silently."
+        ),
+    )
+    mean_cost_per_document_usd: float | None = Field(
+        default=None, description="Cost per invoice. None when cost_usd is None."
+    )
+    projected_cost_usd_per_1000: float | None = Field(
+        default=None,
+        description=(
+            "mean_cost_per_document_usd x 1000 — the client's monthly volume question, "
+            "answered by straight extrapolation from this sample of documents. Extraction "
+            "only: it excludes the accounting API, which is free, and any human review."
+        ),
+    )
 
 
 class ExtractionRun(BaseModel):
@@ -150,6 +268,51 @@ class ExtractionRun(BaseModel):
 
     extracted: list[ExtractedInvoice] = Field(default_factory=list)
     failed: list[FailedInvoice] = Field(default_factory=list)
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def totals(self) -> ExtractionTotals:
+        """Roll the per-document usage records up into one summary.
+
+        A computed property rather than a stored field so it is written into
+        ``output/extract.json`` for a reader, recomputed on load, and impossible to leave
+        stale. Failed extractions are counted too — a truncated response is billed.
+        """
+        records = [
+            item.usage
+            for item in (*self.extracted, *self.failed)
+            if item.usage is not None
+        ]
+
+        # None, not 0.0, when even one record is unpriced — and equally when there is
+        # nothing to price at all. A run whose extractions were all replayed from cache
+        # has measured no cost, which is not the same fact as having cost nothing, and
+        # only one of the two is true of the pipeline.
+        priced = [record.cost_usd for record in records]
+        cost = (
+            None
+            if not records or any(value is None for value in priced)
+            else sum(priced)  # type: ignore[arg-type]
+        )
+
+        count = len(records)
+        return ExtractionTotals(
+            documents_measured=count,
+            documents_billed_this_run=sum(1 for r in records if not r.from_cache),
+            input_tokens=sum(r.input_tokens for r in records),
+            output_tokens=sum(r.output_tokens for r in records),
+            api_seconds=round(sum(r.latency_seconds for r in records), 3),
+            mean_seconds_per_document=(
+                round(sum(r.latency_seconds for r in records) / count, 3) if count else None
+            ),
+            cost_usd=round(cost, 6) if cost is not None else None,
+            mean_cost_per_document_usd=(
+                round(cost / count, 6) if cost is not None and count else None
+            ),
+            projected_cost_usd_per_1000=(
+                round(cost / count * 1000, 2) if cost is not None and count else None
+            ),
+        )
 
 
 class FailedNormalization(BaseModel):

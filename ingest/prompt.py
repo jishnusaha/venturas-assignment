@@ -20,7 +20,6 @@ SYSTEM_PROMPT = """You are transcribing a Japanese business invoice (請求書) 
 
 10. `registration_no_raw` is the SUPPLIER's own 登録番号 (normally "T" followed by 13 digits), read from the supplier's own name and address block — never from the addressee's (御中) block. Do not attempt to name or code the supplier's identity beyond this one field; matching it to a partner is a deterministic lookup done outside this call, and you must never propose a partner code yourself.
 
-11. `low_confidence_fields` and `illegible_fields` should name only the specific fields you genuinely doubt or could not read at all. Leave both empty when you are confident in every field: listing fields "just in case" makes the flag useless to a reviewer who has to check each one by hand.
 """
 
 USER_INSTRUCTION = (
