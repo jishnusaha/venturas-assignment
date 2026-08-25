@@ -19,10 +19,11 @@ import os
 from pathlib import Path
 from typing import Any
 
+import pydantic
 import requests
 from dotenv import load_dotenv
 
-from ingest.schema import Partner
+from ingest.schema import AccountingRecord, Partner
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(REPO_ROOT / ".env")
@@ -39,16 +40,21 @@ class AccountingAPIError(Exception):
     refused, timeout, a non-2xx status, an unreadable body, or an envelope with
     ``success: false``. Carries the API's own ``code`` when there is one (e.g.
     ``"UNAUTHORIZED"``, ``"PARTNER_NOT_FOUND"``) so a caller can react to it without parsing
-    ``str(exc)``.
+    ``str(exc)``. Also carries the HTTP ``status_code`` that produced it, when a response
+    arrived at all — ``None`` for a transport failure (connection refused, timeout), where
+    there was no status to carry.
     """
 
-    def __init__(self, message: str, code: str | None = None) -> None:
+    def __init__(
+        self, message: str, code: str | None = None, status_code: int | None = None
+    ) -> None:
         super().__init__(message)
         self.code = code
         self.message = message
+        self.status_code = status_code
 
 
-def _request(method: str, path: str) -> Any:
+def _request(method: str, path: str, json_body: Any | None = None) -> Any:
     """One HTTP call to the accounting API, envelope-unwrapped, timeout enforced.
 
     Every response — success or failure — arrives as ``{"success", "data", "error"}``; this
@@ -61,7 +67,7 @@ def _request(method: str, path: str) -> Any:
     headers = {"X-API-Key": API_KEY}
     try:
         response = requests.request(
-            method, url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS
+            method, url, headers=headers, json=json_body, timeout=REQUEST_TIMEOUT_SECONDS
         )
     except requests.RequestException as exc:
         logger.exception("accounting API request failed: %s %s", method, url)
@@ -75,7 +81,8 @@ def _request(method: str, path: str) -> Any:
         logger.exception("accounting API returned a non-JSON response: %s %s", method, url)
         raise AccountingAPIError(
             f"The accounting API at {url} returned a response that was not valid JSON "
-            f"(HTTP {response.status_code})."
+            f"(HTTP {response.status_code}).",
+            status_code=response.status_code,
         ) from exc
 
     if not response.ok or not body.get("success"):
@@ -83,7 +90,7 @@ def _request(method: str, path: str) -> Any:
         code = error.get("code", "UNKNOWN")
         message = error.get("message", f"HTTP {response.status_code}")
         logger.error("accounting API error on %s %s: %s %s", method, url, code, message)
-        raise AccountingAPIError(message, code=code)
+        raise AccountingAPIError(message, code=code, status_code=response.status_code)
 
     return body.get("data")
 
@@ -122,3 +129,33 @@ def get_registered_invoices() -> list[dict[str, Any]]:
             "The accounting API returned a malformed /invoices response (no 'invoices' key)."
         )
     return invoices
+
+
+def register_invoice(payload: dict[str, Any]) -> AccountingRecord:
+    """``POST /invoices`` — the one call in this pipeline that changes the accounting
+    system's state, and the one that cannot be undone per-invoice (the API has no update
+    endpoint and its only DELETE clears the whole ledger). Every other failure this client
+    raises is "nothing happened, try again"; this one raises "something may have happened",
+    which is why :func:`ingest.register.register` treats a 409 as a skip rather than a
+    failure and every other error as one this pipeline should have caught itself.
+    """
+    data = _request("POST", "/invoices", json_body=payload)
+    try:
+        if data is None:
+            raise ValueError("no data in a successful response")
+        return AccountingRecord.model_validate(data)
+    except (ValueError, pydantic.ValidationError) as exc:
+        # Not "registration failed": a 201 means _request already confirmed the envelope
+        # said success, so the invoice IS sitting in the ledger. Reporting this as a plain
+        # failure would invite a caller to re-POST it and register the same invoice twice —
+        # instead this is its own reason (`unconfirmed_registration`) telling the clerk to
+        # go check the ledger rather than resend.
+        logger.exception(
+            "accounting API returned 201 for POST /invoices but the record could not be read"
+        )
+        raise AccountingAPIError(
+            "The accounting API accepted this registration (HTTP 201) but returned a "
+            "confirmation record that could not be read.",
+            code="MALFORMED_RESPONSE",
+            status_code=201,
+        ) from exc

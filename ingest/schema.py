@@ -540,3 +540,161 @@ class ValidationRun(BaseModel):
 
     validated: list[ValidatedInvoice] = Field(default_factory=list)
     failed: list[FailedValidation] = Field(default_factory=list)
+
+
+class AccountingRecord(BaseModel):
+    """The accounting system's own record of a registration, exactly what
+    ``accounting_api.py``'s ``_register`` (lines 282-298) stores and returns in the 201
+    body. This is the ledger's receipt, not ours — modelled rather than kept as a raw dict
+    so an unreadable 201 body is caught by pydantic and reported, instead of a malformed
+    record being silently carried through the rest of this pipeline as an opaque blob.
+    """
+
+    accounting_id: str = Field(
+        description="The accounting system's own identifier for this registration, e.g. 'ACC-0001'."
+    )
+    partner_code: str = Field(description="Echoed back from the posted payload.")
+    invoice_number: str = Field(description="Echoed back from the posted payload.")
+    issue_date: date = Field(description="Echoed back from the posted payload.")
+    due_date: date = Field(description="Echoed back from the posted payload.")
+    subtotal: int = Field(description="Echoed back from the posted payload.")
+    tax_amount: int = Field(description="Echoed back from the posted payload.")
+    total_amount: int = Field(description="Echoed back from the posted payload.")
+    line_count: int = Field(
+        description="Number of line items the accounting system recorded — a count, not the lines themselves."
+    )
+
+
+# Every reason register can fail (or skip) an invoice for. Apart from the last three, every
+# one of these means validate passed something the accounting system rejected — validate
+# mirrors each of these checks locally (see ingest/validate.py), so the reason code names
+# which of our own checks disagreed with the ledger, which makes a registration failure a
+# defect in our gate rather than merely a bad invoice.
+#
+#   partner_not_found          — PARTNER_NOT_FOUND (400)
+#   unknown_tax_code           — UNKNOWN_TAX_CODE (400)
+#   due_date_before_issue_date — DUE_DATE_BEFORE_ISSUE_DATE (400)
+#   amount_mismatch            — AMOUNT_MISMATCH (422)
+#   invalid_payload            — VALIDATION_ERROR (422)
+#   unauthorized               — UNAUTHORIZED (401)
+#   endpoint_not_found         — NOT_FOUND (404)
+#   api_unreachable            — no response at all: connection refused, timeout, unreadable body
+#   unconfirmed_registration   — MALFORMED_RESPONSE: a 201 whose record could not be read
+#   unexpected_error           — an error code this pipeline does not know
+RegistrationReason = Literal[
+    "partner_not_found",
+    "unknown_tax_code",
+    "due_date_before_issue_date",
+    "amount_mismatch",
+    "invalid_payload",
+    "unauthorized",
+    "endpoint_not_found",
+    "api_unreachable",
+    "unconfirmed_registration",
+    "unexpected_error",
+]
+
+
+class RegisteredInvoice(BaseModel):
+    """One invoice the accounting system accepted — the terminal, successful record of this
+    pipeline.
+    """
+
+    file_name: str = Field(
+        description="The document's file name, carried through unchanged from every earlier stage."
+    )
+    file_path: Path = Field(
+        description="Absolute path to the source document on disk, carried through unchanged."
+    )
+    source: ValidatedInvoice = Field(
+        description=(
+            "The whole upstream validated record this was registered from, unchanged — the "
+            "same reasoning as NormalizedInvoice.source and ValidatedInvoice.source. "
+            "source.notes records every value validate *supplied* rather than read off the "
+            "page (a derived tax code, a defaulted 単位), so this record answers 'why does "
+            "this registered invoice say T10 when the paper prints no 税率 column' without a "
+            "cross-reference."
+        )
+    )
+    record: AccountingRecord = Field(description="The accounting system's own receipt for this registration.")
+    http_status: int = Field(
+        description="201. Recorded rather than assumed, so the audit log states the outcome it observed."
+    )
+
+
+class SkippedRegistration(BaseModel):
+    """A ``409 DUPLICATE_INVOICE`` from the accounting API. Not a failure: the accounting
+    system independently reached validate's own duplicate verdict, and nothing was written.
+
+    This bucket should normally stay empty. ``main.py`` seeds validate's ``seen_keys`` from
+    ``GET /invoices`` at startup, so a duplicate is normally caught at validate, before
+    register ever runs. A 409 here means the ledger changed after startup — another process
+    registered the same invoice mid-run — and this is the last line of defence against a
+    double payment.
+    """
+
+    file_name: str = Field(description="The document's file name.")
+    file_path: Path = Field(description="Absolute path to the source document on disk.")
+    reason: Literal["duplicate_invoice"] = Field(
+        description=(
+            "Why this invoice was skipped. One member deliberately, the same reasoning as "
+            "SupplierResolution.matched_by: this documents the outcome for an auditor rather "
+            "than encoding a live choice, and leaves room for a future skip reason to be "
+            "added without reshaping this field."
+        )
+    )
+    detail: str = Field(description="Plain language for the accounting clerk.")
+    payload: RegistrationPayload = Field(
+        description=(
+            "What we would have sent, so a human can compare it against the invoice already "
+            "in the ledger and confirm it really is the same one."
+        )
+    )
+    http_status: int = Field(description="409.")
+
+
+class FailedRegistration(BaseModel):
+    """An invoice the accounting API rejected, or one register could not confirm one way or
+    the other. Mirrors :class:`FailedValidation`'s routable/readable shape: ``reason`` for
+    branching, ``detail`` for a human to read without opening anything else.
+    """
+
+    file_name: str = Field(description="The document's file name.")
+    file_path: Path = Field(description="Absolute path to the source document on disk.")
+    reason: RegistrationReason = Field(description="See RegistrationReason for the full set.")
+    detail: str = Field(
+        description=(
+            "Plain language for the accounting clerk who has to act on this, naming what to "
+            "do — never an exception type or a stack trace, per the standing decision that "
+            "detail is written for the clerk, not the engineer."
+        )
+    )
+    http_status: int | None = Field(
+        description="The API's HTTP status, or None when no response arrived at all (api_unreachable)."
+    )
+    api_code: str | None = Field(
+        description="The API's own error code, verbatim, or None when no response arrived."
+    )
+    api_message: str | None = Field(
+        description=(
+            "The API's own error message, verbatim — engineer-facing evidence, deliberately "
+            "kept out of `detail` per the standing decision that detail is written for the "
+            "accounting clerk, not the engineer. An engineer debugging a registration defect "
+            "reads this field; the clerk reads detail."
+        )
+    )
+    payload: RegistrationPayload = Field(
+        description="The exact body sent, so the rejection can be reproduced."
+    )
+
+
+class RegistrationRun(BaseModel):
+    """The result of one pass of register over a :class:`ValidationRun`'s successes.
+    Mirrors ``ValidationRun{validated, failed}`` / ``NormalizationRun{normalized, failed}`` /
+    ``ExtractionRun{extracted, failed}``, but with a third bucket: a 409 duplicate is neither
+    a success nor a defect in this pipeline's gate, so it is kept apart from both.
+    """
+
+    registered: list[RegisteredInvoice] = Field(default_factory=list)
+    skipped: list[SkippedRegistration] = Field(default_factory=list)
+    failed: list[FailedRegistration] = Field(default_factory=list)

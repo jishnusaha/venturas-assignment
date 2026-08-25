@@ -20,14 +20,19 @@ from ingest.accounting import (
     health,
 )
 from ingest.validate import build_partner_index, validate
+from ingest.register import register
 from ingest.schema import (
     ExtractedInvoice,
     FailedInvoice,
     ExtractionRun,
     NormalizationRun,
     FailedNormalization,
+    FailedRegistration,
     FailedValidation,
     NormalizedInvoice,
+    RegisteredInvoice,
+    RegistrationRun,
+    SkippedRegistration,
     ValidatedInvoice,
     ValidationRun,
     MEDIA_TYPES,
@@ -39,6 +44,7 @@ OUTPUT_DIR = REPO_ROOT / "output"
 EXTRACT_OUTPUT = OUTPUT_DIR / "extract.json"
 NORMALIZE_OUTPUT = OUTPUT_DIR / "normalize.json"
 VALIDATE_OUTPUT = OUTPUT_DIR / "validate.json"
+REGISTER_OUTPUT = OUTPUT_DIR / "register.json"
 INVOICE_DIR = REPO_ROOT / "invoices"
 
 load_dotenv(REPO_ROOT / ".env")
@@ -112,6 +118,11 @@ if __name__ == "__main__":
     validation_success_list: list[ValidatedInvoice] = []
     validation_failed_list: list[FailedValidation] = []
 
+    # registration data
+    registration_success_list: list[RegisteredInvoice] = []
+    registration_skipped_list: list[SkippedRegistration] = []
+    registration_failed_list: list[FailedRegistration] = []
+
     for path in sorted(INVOICE_DIR.iterdir()):
         if path.is_file() and path.suffix.lower() in MEDIA_TYPES:
             print(f"{path.name}\t{path.resolve()}")
@@ -137,6 +148,20 @@ if __name__ == "__main__":
                                 )
                             )
 
+                            # The one irreversible step in the pipeline, and the only one
+                            # that changes state outside this process. Note what that costs
+                            # here: the audit files are written after this loop, so a crash
+                            # mid-run can leave invoices in the accounting ledger with no
+                            # output/*.json describing why they were sent. Recovery is
+                            # GET /invoices, which is the ledger's own record of what landed.
+                            registered_data = register(validated_data)
+                            if isinstance(registered_data, RegisteredInvoice):
+                                registration_success_list.append(registered_data)
+                            elif isinstance(registered_data, SkippedRegistration):
+                                registration_skipped_list.append(registered_data)
+                            else:
+                                registration_failed_list.append(registered_data)
+
                         else:
                             validation_failed_list.append(validated_data)
                     else:
@@ -159,3 +184,10 @@ if __name__ == "__main__":
         validated=validation_success_list, failed=validation_failed_list
     )
     write_output(VALIDATE_OUTPUT, validation_result.model_dump_json(indent=2))
+
+    registration_result = RegistrationRun(
+        registered=registration_success_list,
+        skipped=registration_skipped_list,
+        failed=registration_failed_list,
+    )
+    write_output(REGISTER_OUTPUT, registration_result.model_dump_json(indent=2))
