@@ -140,7 +140,6 @@ def extract(path: Path) -> ExtractedInvoice | FailedInvoice:
     # return from local if already run (skip llm call for testing)
     # return return_from_local(path)
 
-    print(f"extracting: {path.name}\t{path.resolve()}")
     started = time.perf_counter()
     try:
         response = client.messages.parse(

@@ -51,6 +51,21 @@ INVOICE_DIR = REPO_ROOT / "invoices"
 load_dotenv(REPO_ROOT / ".env")
 
 
+STAGES = ("extract", "handwriting", "normalize", "validate", "register")
+NAME_WIDTH = 18
+COLUMN_WIDTH = 13
+
+
+def mark(passed: bool) -> None:
+    """Print one cell of the progress table, without ending the line.
+
+    ``flush`` is the whole trick: a row is printed a cell at a time across stages that each
+    take seconds, so without it the line would sit in the buffer and the whole table would
+    appear at once when the run ended.
+    """
+    print(f"{'✓' if passed else '✗':^{COLUMN_WIDTH}}", end="", flush=True)
+
+
 def write_output(path: Path, payload: str) -> None:
     """Record one stage's output on disk, creating the output directory on first use.
 
@@ -59,7 +74,7 @@ def write_output(path: Path, payload: str) -> None:
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(payload, encoding="utf-8")
-    print(f"written {path}")
+    # print(f"written {path}")
 
 
 if __name__ == "__main__":
@@ -102,9 +117,12 @@ if __name__ == "__main__":
         for record in registered_invoices
     }
 
+    # Worth one line before the table: an invoice coming back as a duplicate below is only
+    # explicable if you can see how much was already sitting in the ledger when we started.
     print(
-        f"accounting API ok (status={health_status.get('status')}); "
-        f"{len(partners)} partner(s) loaded; {len(seen_keys)} invoice(s) already registered"
+        f"accounting API ok (status={health_status.get('status')}) · "
+        f"{len(partners)} partner(s) · "
+        f"{len(seen_keys)} invoice(s) already in the ledger\n"
     )
 
     # extraction data
@@ -124,22 +142,40 @@ if __name__ == "__main__":
     registration_skipped_list: list[SkippedRegistration] = []
     registration_failed_list: list[FailedRegistration] = []
 
+    header = f"{'file':<{NAME_WIDTH}}" + "".join(
+        f"{stage:^{COLUMN_WIDTH}}" for stage in STAGES
+    )
+    print(header)
+    print("-" * len(header))
+
     for path in sorted(INVOICE_DIR.iterdir()):
         if path.is_file() and path.suffix.lower() in MEDIA_TYPES:
-            print(f"{path.name}\t{path.resolve()}")
+            # The row opens here and is closed by the print() after the branches below.
+            # Everything between is one cell per stage, appearing as that stage returns.
+            print(f"{path.name:<{NAME_WIDTH}}", end="", flush=True)
 
             extracted_data = extract(path)
             if isinstance(extracted_data, ExtractedInvoice):
                 extraction_success_list.append(extracted_data)
-                if not extracted_data.extraction.flags.handwriting_note:
+                mark(True)
+
+                # ✓ here means handwriting was FOUND, which is why the row stops — the one
+                # column where a tick is bad news. Read off the same value the gate below
+                # uses, so the table can never disagree with the routing it is showing.
+                has_handwriting = bool(extracted_data.extraction.flags.handwriting_note)
+                mark(has_handwriting)
+
+                if not has_handwriting:
                     normalized_data = normalize(extracted_data)
                     if isinstance(normalized_data, NormalizedInvoice):
                         normalization_success_list.append(normalized_data)
+                        mark(True)
                         validated_data = validate(
                             normalized_data, partner_index, seen_keys
                         )
                         if isinstance(validated_data, ValidatedInvoice):
                             validation_success_list.append(validated_data)
+                            mark(True)
                             # The *second* copy of a within-batch duplicate is the one that
                             # fails, so the key only enters the set once this one has passed.
                             seen_keys.add(
@@ -158,18 +194,30 @@ if __name__ == "__main__":
                             registered_data = register(validated_data)
                             if isinstance(registered_data, RegisteredInvoice):
                                 registration_success_list.append(registered_data)
+                                mark(True)
                             elif isinstance(registered_data, SkippedRegistration):
+                                # A 409: the ledger already had it, so nothing was written.
                                 registration_skipped_list.append(registered_data)
+                                mark(False)
                             else:
                                 registration_failed_list.append(registered_data)
+                                mark(False)
 
                         else:
                             validation_failed_list.append(validated_data)
+                            mark(False)
                     else:
                         normalization_failed_list.append(normalized_data)
+                        mark(False)
 
             else:
                 extraction_failed_list.append(extracted_data)
+                mark(False)
+
+            # Closes the row. Columns the document never reached are simply absent, which
+            # reads differently from a ✗ and should: one means "stopped here", the other
+            # means "never got here".
+            print()
 
     extraction_result = ExtractionRun(
         extracted=extraction_success_list, failed=extraction_failed_list
@@ -199,5 +247,9 @@ if __name__ == "__main__":
     review_rows = build_review_rows(
         extraction_result, normalization_result, validation_result, registration_result
     )
-    print(f"written {write_review_report(review_rows)}")
-    print(summarize(review_rows))
+    write_review_report(review_rows)
+
+    print(f"\n{summarize(review_rows)}")
+    print(f"\n{OUTPUT_DIR}/")
+    print("  review_report.json    one row per document — start here")
+    print("  extract.json  normalize.json  validate.json  register.json")
