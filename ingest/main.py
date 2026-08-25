@@ -21,6 +21,7 @@ from ingest.accounting import (
 )
 from ingest.validate import build_partner_index, validate
 from ingest.register import register
+from ingest.report import build_review_rows, summarize, write_review_report
 from ingest.schema import (
     ExtractedInvoice,
     FailedInvoice,
@@ -191,3 +192,12 @@ if __name__ == "__main__":
         failed=registration_failed_list,
     )
     write_output(REGISTER_OUTPUT, registration_result.model_dump_json(indent=2))
+
+    # Last, because it is a view over the four files above rather than a fifth stage. Built
+    # from the in-memory runs, not by re-reading what was just written — the two are the same
+    # objects, and `python -m ingest.report` exists for rebuilding it from disk later.
+    review_rows = build_review_rows(
+        extraction_result, normalization_result, validation_result, registration_result
+    )
+    print(f"written {write_review_report(review_rows)}")
+    print(summarize(review_rows))

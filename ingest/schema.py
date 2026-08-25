@@ -861,3 +861,40 @@ class RegistrationRun(BaseModel):
     registered: list[RegisteredInvoice] = Field(default_factory=list)
     skipped: list[SkippedRegistration] = Field(default_factory=list)
     failed: list[FailedRegistration] = Field(default_factory=list)
+
+
+
+class ReviewRow(BaseModel):
+    """One source document's trip through the four stages, as a flag per stage.
+
+    Derived entirely from ``output/*.json`` — it carries no fact those four files do not
+    already hold, and exists so that "what happened to the twelve invoices" is one file to
+    read rather than four to reconcile by hand. See ``ingest/report.py``.
+
+    The flags are *reached and passed*, not *attempted*: an invoice held at validate has
+    ``normalized: true, validated: false``, and everything after a false is false too.
+    ``registered`` is therefore the only one that means the ledger changed.
+    """
+
+    file_name: str = Field(description="The document's file name, e.g. 'invoice_08.jpg'.")
+    extracted: bool = Field(description="The vision model returned a schema-valid reading.")
+    has_handwriting: bool = Field(
+        description=(
+            "The model saw handwriting anywhere on the page, including marks touching no "
+            "figure. Not a stage — a property of the document that routes it to a human."
+        )
+    )
+    normalized: bool = Field(description="Every printed string converted without a converter raising.")
+    validated: bool = Field(description="All 8 checks passed; safe to register automatically.")
+    registered: bool = Field(description="The accounting API accepted it (HTTP 201).")
+    reason: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Every note and every failure recorded against this document, each as "
+            "'code: sentence'. Always empty when `registered` is true: the invoice is in "
+            "the ledger and nobody has anything to do with it, so a non-empty reason means "
+            "exactly one thing — somebody needs to look at this. Notes about values the "
+            "pipeline supplied rather than read (a derived tax code, a defaulted 単位) stay "
+            "on the ValidatedInvoice in validate.json for anyone auditing a registration."
+        ),
+    )
